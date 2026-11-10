@@ -1,0 +1,352 @@
+name: build
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.8
+      - name: Create files
+        run: |
+          mkdir -p src/main/java/com/example/aiplayer src/main/resources
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx1G
+          minecraft_version=1.21.1
+          yarn_mappings=1.21.1+build.3
+          loader_version=0.16.5
+          fabric_version=0.102.0+1.21.1
+          mod_version=1.0.0
+          maven_group=com.example
+          archives_base_name=aiplayer
+          EOF
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  maven { url = 'https://maven.fabricmc.net/' }
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'fabric-loom' version '1.7-SNAPSHOT'
+          }
+
+          version = project.mod_version
+          group = project.maven_group
+
+          base {
+              archivesName = project.archives_base_name
+          }
+
+          repositories {
+              mavenCentral()
+          }
+
+          dependencies {
+              minecraft "com.mojang:minecraft:${project.minecraft_version}"
+              mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+              modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+              modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+          }
+
+          processResources {
+              inputs.property "version", project.version
+              filesMatching("fabric.mod.json") {
+                  expand "version": project.version
+              }
+          }
+
+          tasks.withType(JavaCompile).configureEach {
+              it.options.release = 21
+          }
+
+          java {
+              sourceCompatibility = JavaVersion.VERSION_21
+              targetCompatibility = JavaVersion.VERSION_21
+          }
+          EOF
+
+          cat > src/main/resources/fabric.mod.json <<'EOF'
+          {
+            "schemaVersion": 1,
+            "id": "aiplayer",
+            "version": "${version}",
+            "name": "AI Player",
+            "description": "Talk to an AI in chat.",
+            "authors": ["You"],
+            "environment": "*",
+            "entrypoints": {
+              "main": ["com.example.aiplayer.AiPlayerMod"]
+            },
+            "depends": {
+              "fabricloader": ">=0.16.0",
+              "minecraft": "~1.21.1",
+              "java": ">=21",
+              "fabric-api": "*"
+            }
+          }
+          EOF
+
+          cat > src/main/java/com/example/aiplayer/AiConfig.java <<'EOF'
+          package com.example.aiplayer;
+
+          import com.google.gson.Gson;
+          import com.google.gson.GsonBuilder;
+          import java.io.IOException;
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+          import net.fabricmc.loader.api.FabricLoader;
+
+          public class AiConfig {
+              private static final Gson G = new GsonBuilder().setPrettyPrinting().create();
+
+              public String apiUrl = "https://api.groq.com/openai/v1/chat/completions";
+              public String apiKey = "";
+              public String model = "llama-3.1-8b-instant";
+              public String name = "AI";
+              public String personality = "You are a friendly Minecraft player who plays together with the user. "
+                  + "Answer in 1 or 2 short sentences. Speak casually. "
+                  + "If the user writes in Tagalog, answer in Tagalog.";
+
+              static Path path() {
+                  return FabricLoader.getInstance().getConfigDir().resolve("aiplayer.json");
+              }
+
+              public static AiConfig load() {
+                  try {
+                      Path p = path();
+                      if (Files.exists(p)) {
+                          AiConfig c = G.fromJson(Files.readString(p), AiConfig.class);
+                          if (c != null) return c;
+                      }
+                  } catch (Exception e) {
+                      // fall through to defaults
+                  }
+                  AiConfig c = new AiConfig();
+                  c.save();
+                  return c;
+              }
+
+              public void save() {
+                  try {
+                      Files.createDirectories(path().getParent());
+                      Files.writeString(path(), G.toJson(this));
+                  } catch (IOException e) {
+                      // ignore
+                  }
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/aiplayer/AiPlayerMod.java <<'EOF'
+          package com.example.aiplayer;
+
+          import com.google.gson.JsonArray;
+          import com.google.gson.JsonObject;
+          import com.google.gson.JsonParser;
+          import com.mojang.brigadier.arguments.StringArgumentType;
+          import com.mojang.brigadier.builder.LiteralArgumentBuilder;
+          import java.net.URI;
+          import java.net.http.HttpClient;
+          import java.net.http.HttpRequest;
+          import java.net.http.HttpResponse;
+          import java.time.Duration;
+          import java.util.ArrayList;
+          import java.util.HashMap;
+          import java.util.Locale;
+          import java.util.Map;
+          import java.util.Set;
+          import java.util.UUID;
+          import java.util.concurrent.ConcurrentHashMap;
+          import java.util.function.Consumer;
+          import net.fabricmc.api.ModInitializer;
+          import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
+          import net.fabricmc.fabric.api.message.v1.ServerMessageEvents;
+          import net.minecraft.server.MinecraftServer;
+          import net.minecraft.server.command.CommandManager;
+          import net.minecraft.server.command.ServerCommandSource;
+          import net.minecraft.server.network.ServerPlayerEntity;
+          import net.minecraft.text.Text;
+
+          public class AiPlayerMod implements ModInitializer {
+              static AiConfig config;
+              static final HttpClient HTTP = HttpClient.newHttpClient();
+              static final Map<UUID, ArrayList<String[]>> history = new HashMap<>();
+              static final Set<UUID> busy = ConcurrentHashMap.newKeySet();
+
+              @Override
+              public void onInitialize() {
+                  config = AiConfig.load();
+
+                  CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> {
+                      dispatcher.register(CommandManager.literal("ai")
+                          .then(setter("key", v -> config.apiKey = v))
+                          .then(setter("model", v -> config.model = v))
+                          .then(setter("url", v -> config.apiUrl = v))
+                          .then(setter("name", v -> config.name = v))
+                          .then(setter("personality", v -> config.personality = v))
+                          .then(CommandManager.literal("clear").executes(ctx -> {
+                              ServerPlayerEntity p = ctx.getSource().getPlayerOrThrow();
+                              history.remove(p.getUuid());
+                              ctx.getSource().sendFeedback(() -> Text.literal("AI memory cleared"), false);
+                              return 1;
+                          }))
+                          .then(CommandManager.literal("status").executes(ctx -> {
+                              String s = "Name: " + config.name + " | Model: " + config.model
+                                  + " | Key: " + (config.apiKey.isBlank() ? "NOT SET" : "set")
+                                  + " | URL: " + config.apiUrl;
+                              ctx.getSource().sendFeedback(() -> Text.literal(s), false);
+                              return 1;
+                          }))
+                          .then(CommandManager.argument("message", StringArgumentType.greedyString()).executes(ctx -> {
+                              ServerPlayerEntity p = ctx.getSource().getPlayerOrThrow();
+                              String m = StringArgumentType.getString(ctx, "message").trim();
+                              MinecraftServer server = p.getServer();
+                              if (server != null) {
+                                  server.getPlayerManager().broadcast(
+                                      Text.literal("<" + p.getName().getString() + "> " + m), false);
+                              }
+                              ask(p, m);
+                              return 1;
+                          })));
+                  });
+
+                  ServerMessageEvents.CHAT_MESSAGE.register((message, sender, params) -> {
+                      String t = message.getContent().getString().trim();
+                      String l = t.toLowerCase(Locale.ROOT);
+                      String n = config.name.toLowerCase(Locale.ROOT);
+                      String rest = null;
+                      if (l.startsWith("@" + n)) rest = t.substring(n.length() + 1);
+                      else if (l.startsWith(n + ",") || l.startsWith(n + " ")) rest = t.substring(n.length() + 1);
+                      if (rest != null) {
+                          rest = rest.trim();
+                          if (!rest.isEmpty()) ask(sender, rest);
+                      }
+                  });
+              }
+
+              static LiteralArgumentBuilder<ServerCommandSource> setter(String lit, Consumer<String> f) {
+                  return CommandManager.literal(lit)
+                      .requires(s -> s.hasPermissionLevel(2))
+                      .then(CommandManager.argument("value", StringArgumentType.greedyString()).executes(ctx -> {
+                          f.accept(StringArgumentType.getString(ctx, "value").trim());
+                          config.save();
+                          ctx.getSource().sendFeedback(() -> Text.literal("Saved: " + lit), false);
+                          return 1;
+                      }));
+              }
+
+              static void say(MinecraftServer server, String text) {
+                  String t = text.length() > 600 ? text.substring(0, 600) : text;
+                  for (String line : t.split("\n")) {
+                      if (line.isBlank()) continue;
+                      server.getPlayerManager().broadcast(Text.literal("<" + config.name + "> " + line.trim()), false);
+                  }
+              }
+
+              static void ask(ServerPlayerEntity p, String text) {
+                  MinecraftServer server = p.getServer();
+                  if (server == null) return;
+                  if (config.apiKey == null || config.apiKey.isBlank()) {
+                      say(server, "I have no API key yet. An op must type: /ai key YOUR_KEY");
+                      return;
+                  }
+                  UUID id = p.getUuid();
+                  if (!busy.add(id)) {
+                      say(server, "Wait, I'm still thinking...");
+                      return;
+                  }
+
+                  ArrayList<String[]> h = history.computeIfAbsent(id, k -> new ArrayList<>());
+                  h.add(new String[]{"user", text});
+                  while (h.size() > 12) h.remove(0);
+
+                  String ctxInfo = " The player talking to you is " + p.getName().getString()
+                      + ", at " + p.getBlockPos().getX() + " " + p.getBlockPos().getY() + " " + p.getBlockPos().getZ()
+                      + " in " + p.getServerWorld().getRegistryKey().getValue()
+                      + ", health " + Math.round(p.getHealth()) + "/20.";
+
+                  JsonArray msgs = new JsonArray();
+                  JsonObject sys = new JsonObject();
+                  sys.addProperty("role", "system");
+                  sys.addProperty("content", config.personality + ctxInfo);
+                  msgs.add(sys);
+                  for (String[] m : h) {
+                      JsonObject o = new JsonObject();
+                      o.addProperty("role", m[0]);
+                      o.addProperty("content", m[1]);
+                      msgs.add(o);
+                  }
+                  JsonObject body = new JsonObject();
+                  body.addProperty("model", config.model);
+                  body.add("messages", msgs);
+                  body.addProperty("max_tokens", 200);
+
+                  HttpRequest req;
+                  try {
+                      req = HttpRequest.newBuilder(URI.create(config.apiUrl))
+                          .header("Content-Type", "application/json")
+                          .header("Authorization", "Bearer " + config.apiKey)
+                          .timeout(Duration.ofSeconds(30))
+                          .POST(HttpRequest.BodyPublishers.ofString(body.toString()))
+                          .build();
+                  } catch (RuntimeException e) {
+                      busy.remove(id);
+                      say(server, "The API url looks wrong. Use /ai url <link>");
+                      return;
+                  }
+
+                  HTTP.sendAsync(req, HttpResponse.BodyHandlers.ofString()).whenComplete((resp, err) -> {
+                      String[] r = result(resp, err);
+                      server.execute(() -> {
+                          busy.remove(id);
+                          if (r[0].equals("1")) {
+                              h.add(new String[]{"assistant", r[1]});
+                              while (h.size() > 12) h.remove(0);
+                          }
+                          say(server, r[1]);
+                      });
+                  });
+              }
+
+              static String[] result(HttpResponse<String> resp, Throwable err) {
+                  if (err != null) {
+                      Throwable c = err.getCause() != null ? err.getCause() : err;
+                      return new String[]{"0", "Could not reach the AI: " + c.getClass().getSimpleName() + " " + c.getMessage()};
+                  }
+                  String b = resp.body();
+                  if (resp.statusCode() / 100 != 2) {
+                      String shortBody = b.length() > 200 ? b.substring(0, 200) : b;
+                      return new String[]{"0", "AI error " + resp.statusCode() + ": " + shortBody};
+                  }
+                  try {
+                      JsonObject o = JsonParser.parseString(b).getAsJsonObject();
+                      String text = o.getAsJsonArray("choices").get(0).getAsJsonObject()
+                          .getAsJsonObject("message").get("content").getAsString().trim();
+                      return new String[]{"1", text};
+                  } catch (RuntimeException e) {
+                      return new String[]{"0", "Could not read the AI answer."};
+                  }
+              }
+          }
+          EOF
+
+      - name: Run gradle build
+        run: gradle build --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aiplayer-jar
+          path: build/libs/*.jar
